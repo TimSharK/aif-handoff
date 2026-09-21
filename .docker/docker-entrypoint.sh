@@ -9,6 +9,13 @@ if [ "$(id -u)" = "0" ]; then
     chown node:node /home/node/.claude.json 2>/dev/null || true
   fi
   export HOME=/home/node
+# git credential store sets mode 600 on write — the agent runs as `node`,
+# not root, and cannot read a root-owned 600 file (push fails with
+# "could not read Username"). Fix permissions on every start.
+if [ -f /home/www/.git-credentials ]; then
+    chmod 666 /home/www/.git-credentials || true
+fi
+
   exec gosu node "$@"
 else
   exec "$@"

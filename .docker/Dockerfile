@@ -126,6 +126,12 @@ ENV NODE_ENV=production \
 ARG CLAUDE_CODE_VERSION=2.1.220
 RUN apt-install ca-certificates gosu git curl jq python3 gh \
     && npm i -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+# PHP 8.5 (Sury) - backs PHP projects' quality gates (make cs / psalm / test):
+# Debian bookworm ships 8.2 only while legacy repos require >=8.5. Without an
+# interpreter the gates degrade to 'physically impossible' and get skipped.
+RUN curl -sSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/sury.gpg] https://packages.sury.org/php/ bookworm main" > /etc/apt/sources.list.d/sury.list \
+    && apt-install php8.5-cli php8.5-mbstring php8.5-xml php8.5-intl php8.5-sqlite3 php8.5-curl php8.5-zip php8.5-bcmath
 COPY --chown=node:node --from=deps /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/packages/shared ./packages/shared
 COPY --chown=node:node --from=build /app/packages/data ./packages/data

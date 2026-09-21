@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -117,6 +117,125 @@ function resolveAiFactoryCommand(agentIds: string, useConfig: boolean): AiFactor
 }
 
 /**
+ * Ensure the project `.mcp.json` contains default MCP servers.
+ *
+ * Driven by `AIF_PROJECT_MCP_DEFAULTS_JSON` — a JSON object (or an object with
+ * a `mcpServers` key) whose entries use the `.mcp.json` server format, e.g.
+ * `{"bridge":{"type":"http","url":"http://host.docker.internal:8022/mcp"}}`.
+ *
+ * Idempotent: merges only keys missing from the existing project config and
+ * never rewrites entries already present. No-op when the env var is unset or
+ * invalid, so upstream behaviour is unchanged by default.
+ */
+function ensureDefaultMcpServers(projectRoot: string): void {
+  const raw = process.env.AIF_PROJECT_MCP_DEFAULTS_JSON?.trim();
+  if (!raw) return;
+
+  let defaults: Record<string, unknown> | null = null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const candidate = (parsed as { mcpServers?: unknown }).mcpServers ?? parsed;
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+        defaults = candidate as Record<string, unknown>;
+      }
+    }
+  } catch {
+    defaults = null;
+  }
+  if (!defaults) {
+    log.warn("AIF_PROJECT_MCP_DEFAULTS_JSON is invalid JSON — skipping default MCP servers");
+    return;
+  }
+  if (Object.keys(defaults).length === 0) return;
+
+  const mcpPath = resolve(projectRoot, ".mcp.json");
+  let config: { mcpServers?: Record<string, unknown> } = {};
+  if (existsSync(mcpPath)) {
+    try {
+      config = JSON.parse(readFileSync(mcpPath, "utf-8")) as typeof config;
+    } catch {
+      log.warn({ mcpPath }, "Existing .mcp.json is not valid JSON — leaving it untouched");
+      return;
+    }
+  }
+
+  const servers = config.mcpServers ?? {};
+  const added = Object.keys(defaults).filter((key) => !(key in servers));
+  if (added.length === 0) return;
+
+  for (const key of added) servers[key] = defaults[key];
+  config.mcpServers = servers;
+  writeFileSync(mcpPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+  log.info({ projectRoot, servers: added }, "Default MCP servers ensured in project .mcp.json");
+}
+
+/**
+ * Ensure the project CLAUDE.md carries shared agent rules (quality gates).
+ *
+ * Driven by `AIF_PROJECT_SHARED_RULES_FILE` — path (inside the containers, e.g.
+ * below PROJECTS_MOUNT) to a markdown file appended to every project's CLAUDE.md
+ * under a marker. Idempotent: projects already carrying the marker are skipped.
+ * No-op when the env var is unset or the file is missing.
+ */
+const SHARED_RULES_MARKER = "<!-- aif:shared-rules -->";
+
+function ensureProjectSharedRules(projectRoot: string): void {
+  const rulesPath = process.env.AIF_PROJECT_SHARED_RULES_FILE?.trim();
+  if (!rulesPath) return;
+
+  let rules: string;
+  try {
+    rules = readFileSync(rulesPath, "utf-8").trim();
+  } catch {
+    return;
+  }
+  if (!rules) return;
+
+  const claudePath = resolve(projectRoot, "CLAUDE.md");
+  let existing = "";
+  if (existsSync(claudePath)) {
+    existing = readFileSync(claudePath, "utf-8");
+    if (existing.includes(SHARED_RULES_MARKER)) return;
+  }
+
+  const separator = existing && !existing.endsWith("\n") ? "\n" : "";
+  const addition = `${separator}\n${SHARED_RULES_MARKER}\n${rules}\n`;
+  writeFileSync(claudePath, existing + addition, "utf-8");
+  log.info({ projectRoot, source: rulesPath }, "Shared agent rules appended to project CLAUDE.md");
+}
+
+/**
+ * Align `.ai-factory/config.yaml` git.base_branch with the repo's real default
+ * branch. The ai-factory scaffold template always writes `base_branch: main`,
+ * which breaks branch isolation for legacy `master`-based repositories
+ * ("Base branch main does not exist"). No-op when the repo is main-based or
+ * the config/origin HEAD is missing.
+ */
+function alignConfigBaseBranch(projectRoot: string): void {
+  let defaultBranch: string | null = null;
+  try {
+    const out = execFileSync(
+      "git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+      { cwd: projectRoot, encoding: "utf-8", timeout: 10_000 },
+    ).trim();
+    defaultBranch = out.replace(/^origin\//, "") || null;
+  } catch {
+    return;
+  }
+  if (!defaultBranch || defaultBranch === "main") return;
+
+  const cfgPath = resolve(projectRoot, ".ai-factory", "config.yaml");
+  if (!existsSync(cfgPath)) return;
+  const txt = readFileSync(cfgPath, "utf-8");
+  const updated = txt.replace(/(^|\n)(\s*)base_branch:[^\n]*/, `$1$2base_branch: ${defaultBranch}`);
+  if (updated !== txt) {
+    writeFileSync(cfgPath, updated, "utf-8");
+    log.info({ projectRoot, baseBranch: defaultBranch }, "Aligned .ai-factory base_branch with repo default");
+  }
+}
+
+/**
  * Initialize a project directory with all runtime-specific structures.
  *
  * 1. Creates project root + git repo (base scaffold)
@@ -140,6 +259,15 @@ export function initProject(options: InitProjectOptions): InitProjectResult {
 
   // 1. Base scaffold: project root + git (does NOT create .ai-factory/)
   initBaseProjectDirectory(projectRoot);
+
+  // 1b. Merge configured default MCP servers into .mcp.json (no-op by default)
+  ensureDefaultMcpServers(projectRoot);
+
+  // 1c. Append shared agent rules (quality gates) to CLAUDE.md (no-op by default)
+  ensureProjectSharedRules(projectRoot);
+
+  // 1d. Align config base_branch with the repo default (covers existing projects)
+  alignConfigBaseBranch(projectRoot);
 
   // 2. ai-factory init — only for fresh projects
   if (alreadyInitialized) return { ok: true };
@@ -174,6 +302,7 @@ export function initProject(options: InitProjectOptions): InitProjectResult {
       timeout: 60_000,
     });
     log.info({ projectRoot, agents: agentIds }, "ai-factory init completed");
+    alignConfigBaseBranch(projectRoot);
     return { ok: true };
   } catch (err) {
     const message =

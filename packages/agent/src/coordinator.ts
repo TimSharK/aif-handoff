@@ -682,10 +682,30 @@ async function processOneTask(task: TaskRow, stage: StatusTransition): Promise<b
       if (outcome?.status === "rework_requested") {
         clearTaskActiveRuntimeSelection(task.id);
         clearTaskRuntimeLimitSnapshot(task.id);
+        // Model cascade (Together AI pattern): first attempt runs on the cheap
+        // default (Flash); when review sends the task back, escalate to the full
+        // model for the rework — the ~20% of tasks that need it get the thorough
+        // model, the 80% that pass never pay for it.
+        // Model cascade (Together AI pattern): first attempt runs on the cheap
+        // default (Flash); when review sends the task back, escalate to the full
+        // model for the rework. Env: AIF_MODEL_CASCADE_ESCALATE=GLM-5.3
+        const cascadeModel = process.env.AIF_MODEL_CASCADE_ESCALATE?.trim() || null;
+        const currentTask = findTaskById(task.id);
+        const escalateModel =
+          cascadeModel &&
+          currentTask &&
+          (currentTask.modelOverride ?? null) !== cascadeModel;
+        if (escalateModel) {
+          log.info(
+            { taskId: task.id, from: currentTask.modelOverride ?? "(default)", to: cascadeModel, iteration: outcome.currentIteration },
+            "Model cascade: escalating to full model for rework",
+          );
+        }
         updateTaskStatus(
           task.id,
           "implementing",
           {
+            ...(escalateModel ? { modelOverride: cascadeModel } : {}),
             blockedReason: null,
             blockedFromStatus: null,
             retryAfter: null,
