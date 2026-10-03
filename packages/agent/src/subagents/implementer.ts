@@ -21,11 +21,11 @@ import { executeSubagentQuery } from "../subagentQuery.js";
 import { computePendingPlanLayers, computePlanLayers } from "../planLayers.js";
 import {
   assertCurrentBranch,
-  describeDirtyWorkingTree,
   getHeadCommitSha,
   isGitRepo,
   restorePersistedBranch,
   syncBranchWithBase,
+  workingTreeFingerprint,
   type BranchBaseSyncResult,
 } from "../gitBranch.js";
 import { StageManualBlockError } from "../stageErrorHandler.js";
@@ -82,6 +82,32 @@ function isBlockedImplementationResult(resultText: string): boolean {
     normalized.includes("cannot proceed") ||
     normalized.includes("blocked —")
   );
+}
+
+/**
+ * Base-sync outcome surfaced inside the rework header so the model
+ * understands the tree state it inherits (fresh merge or mid-merge
+ * conflicts) instead of discovering conflict markers on its own.
+ */
+function formatBaseSyncBlock(
+  result: BranchBaseSyncResult | null,
+  branchName: string | null,
+): string {
+  if (result?.status === "conflict") {
+    return `
+<<<BASE_SYNC_CONFLICTS — RESOLVE THESE FIRST
+origin/${result.baseBranch} was merged into ${branchName} BEFORE this run and produced merge conflicts. The working tree is MID-MERGE right now. Resolving these files is PART of this rework — do it FIRST:
+${result.conflictedFiles.map((file) => `- ${file}`).join("\n")}
+Rules: edit the files and resolve the conflict markers directly. Do NOT run git merge --abort, git checkout, git reset, or any other git state command — leave the resolved files in the working tree; the commit stage completes the merge afterwards.
+BASE_SYNC_CONFLICTS
+`;
+  }
+  if (result?.status === "merged") {
+    return `
+[note] origin/${result.baseBranch} was freshly merged into this branch before the run (merge commit ${result.mergeCommitSha.slice(0, 8)}) — the base sync part of the rework request is already done. The rework comment below is still the primary instruction.
+`;
+  }
+  return "";
 }
 
 function readCanonicalPlan(
@@ -204,6 +230,15 @@ export async function runImplementer(taskId: string, projectRoot: string): Promi
     logActivity(taskId, "Agent", `Restored feature branch: ${task.branchName}`);
   }
 
+  // Anti-noop guard setup. The snapshot is taken BEFORE base sync so the
+  // guard measures the whole rework round (mechanical merge + model work):
+  // a merge-only rework ("подлей main") legitimately moves HEAD without the
+  // model touching anything, while a model that runs `git merge --abort`
+  // and does nothing falls back to the pre-sync snapshot and is caught.
+  const noopGuard = task.reworkRequested && isGitRepo(projectRoot);
+  const preRunHeadSha = noopGuard ? getHeadCommitSha(projectRoot) : null;
+  const preRunTreeFingerprint = noopGuard ? workingTreeFingerprint(projectRoot) : null;
+
   // Rework base sync: mechanically merge origin/<base> into the feature
   // branch before the implementer runs. Rework comments like "подлей main"
   // describe a git operation the implementer model is architecturally barred
@@ -306,23 +341,7 @@ HANDOFF_SKIP_REVIEW: ${task.skipReview ? "1" : "0"}`;
 
   const isRework = task.reworkRequested;
 
-  // Base-sync outcome is surfaced inside the rework header so the model
-  // understands the tree state it inherits (fresh merge or mid-merge
-  // conflicts) instead of discovering conflict markers on its own.
-  const baseSyncBlock =
-    baseSyncResult?.status === "conflict"
-      ? `
-<<<BASE_SYNC_CONFLICTS — RESOLVE THESE FIRST
-origin/${baseSyncResult.baseBranch} was merged into ${task.branchName} BEFORE this run and produced merge conflicts. The working tree is MID-MERGE right now. Resolving these files is PART of this rework — do it FIRST:
-${baseSyncResult.conflictedFiles.map((file) => `- ${file}`).join("\n")}
-Rules: edit the files and resolve the conflict markers directly. Do NOT run git merge --abort, git checkout, git reset, or any other git state command — leave the resolved files in the working tree; the commit stage completes the merge afterwards.
-BASE_SYNC_CONFLICTS
-`
-      : baseSyncResult?.status === "merged"
-        ? `
-[note] origin/${baseSyncResult.baseBranch} was freshly merged into this branch before the run (merge commit ${baseSyncResult.mergeCommitSha.slice(0, 8)}) — the base sync part of the rework request is already done. The rework comment below is still the primary instruction.
-`
-        : "";
+  const baseSyncBlock = formatBaseSyncBlock(baseSyncResult, task.branchName);
 
   // Rework header is surfaced loudly so the model cannot miss that this is
   // a reopened task with an explicit human/agent rework comment.
@@ -424,12 +443,6 @@ Execution rules:
     },
   });
 
-  // Anti-noop snapshot: taken AFTER base sync (a mechanical merge legitimately
-  // moves HEAD) but BEFORE the model runs, so "the rework changed nothing"
-  // reflects the implementer's own (in)action, not the coordinator's.
-  const preRunHeadSha = isRework ? getHeadCommitSha(projectRoot) : null;
-  const preRunDirty = isRework ? describeDirtyWorkingTree(projectRoot) : null;
-
   const { resultText } = await executeSubagentQuery({
     taskId,
     projectRoot,
@@ -457,17 +470,18 @@ Execution rules:
     throw new Error("Implementer blocked by permissions");
   }
 
-  // Anti-noop guard for rework: a rework run that produced zero repo changes
-  // (same HEAD, same working tree) did not address the reviewer's request,
-  // whatever the result text claims. Accepting it as done previously let a
-  // model "complete" a merge-main request in seven seconds, twice. Block
-  // manually instead — the discrepancy must be visible to the human, and a
-  // genuine no-change-needed outcome can be resolved by inspection and a
-  // manual done.
-  if (isRework && isGitRepo(projectRoot)) {
-    const postRunHeadSha = getHeadCommitSha(projectRoot);
-    const postRunDirty = describeDirtyWorkingTree(projectRoot);
-    if (postRunHeadSha === preRunHeadSha && postRunDirty === preRunDirty) {
+  // Anti-noop guard for rework: a rework round that produced zero repo
+  // changes (same HEAD, same working-tree fingerprint) did not address the
+  // reviewer's request, whatever the result text claims. Accepting it as
+  // done previously let a model "complete" a merge-main request in seven
+  // seconds, twice. Block manually instead — the discrepancy must be
+  // visible to the human, and a genuine no-change-needed outcome can be
+  // resolved by inspection and a manual done.
+  if (noopGuard) {
+    if (
+      getHeadCommitSha(projectRoot) === preRunHeadSha &&
+      workingTreeFingerprint(projectRoot) === preRunTreeFingerprint
+    ) {
       throw new StageManualBlockError(
         `Rework no-op: implementer finished with no repo changes (HEAD unchanged at ${(preRunHeadSha ?? "unknown").slice(0, 8)}, working tree unchanged) while a rework request was pending. Refusing to accept a rework round that did nothing.`,
       );

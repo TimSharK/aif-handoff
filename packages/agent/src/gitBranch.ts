@@ -19,6 +19,7 @@ export {
   syncBranchWithBase,
   validateBranchName,
   workingTreeClean,
+  workingTreeFingerprint,
   type BranchBaseSyncResult,
   type EnsureFeatureBranchInput,
   type EnsureFeatureBranchResult,

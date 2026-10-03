@@ -41,6 +41,14 @@ function initRemoteFixture(root: string, branch: string): string {
   return originPath;
 }
 
+/** Push `branch` (with its committed work) to the fixture origin, then
+ *  delete the local ref, leaving the remote-tracking ref behind. */
+function pushBranchAndWipeLocal(root: string, branch: string): void {
+  initRemoteFixture(root, branch);
+  execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["branch", "-D", branch], { cwd: root, stdio: "ignore" });
+}
+
 function writeConfig(root: string, yaml: string): void {
   const dir = join(root, ".ai-factory");
   mkdirSync(dir, { recursive: true });
@@ -405,10 +413,7 @@ describe("gitBranch helpers", () => {
     execFileSync("git", ["checkout", "-b", "feature/ok"], { cwd: root, stdio: "ignore" });
     writeFileSync(join(root, "work.txt"), "done\n");
     commitAll(root, "stage work");
-    initRemoteFixture(root, "feature/ok");
-    // Repo-level wipe: local ref gone, remote-tracking ref intact (re-clone).
-    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
-    execFileSync("git", ["branch", "-D", "feature/ok"], { cwd: root, stdio: "ignore" });
+    pushBranchAndWipeLocal(root, "feature/ok");
     const {
       restorePersistedBranch,
       getCurrentBranch: curr,
@@ -425,9 +430,7 @@ describe("gitBranch helpers", () => {
     execFileSync("git", ["checkout", "-b", "feature/ok"], { cwd: root, stdio: "ignore" });
     writeFileSync(join(root, "work.txt"), "done\n");
     commitAll(root, "stage work");
-    initRemoteFixture(root, "feature/ok");
-    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
-    execFileSync("git", ["branch", "-D", "feature/ok"], { cwd: root, stdio: "ignore" });
+    pushBranchAndWipeLocal(root, "feature/ok");
     execFileSync("git", ["update-ref", "-d", "refs/remotes/origin/feature/ok"], {
       cwd: root,
       stdio: "ignore",
@@ -443,9 +446,7 @@ describe("gitBranch helpers", () => {
     execFileSync("git", ["checkout", "-b", "feature/remote-only"], { cwd: root, stdio: "ignore" });
     writeFileSync(join(root, "work.txt"), "done\n");
     commitAll(root, "stage work");
-    initRemoteFixture(root, "feature/remote-only");
-    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
-    execFileSync("git", ["branch", "-D", "feature/remote-only"], { cwd: root, stdio: "ignore" });
+    pushBranchAndWipeLocal(root, "feature/remote-only");
     const { ensureFeatureBranch: fn, getCurrentBranch: curr } = await import("../gitBranch.js");
     const result = fn({
       projectRoot: root,

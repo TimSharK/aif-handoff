@@ -126,7 +126,7 @@ function runGit(
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+    timeout: opts.timeoutMs,
   };
   try {
     const stdout = execFileSync("git", args, options);
@@ -212,6 +212,21 @@ function remoteConfigured(projectRoot: string): boolean {
 }
 
 /**
+ * Narrow, timeout-bounded fetch of one branch into its remote-tracking ref.
+ * Only reached when `refs/remotes/origin/<branch>` is missing and the remote
+ * is configured; returns whether the ref is available afterwards.
+ */
+function fetchOriginBranch(projectRoot: string, branchName: string): boolean {
+  if (!remoteConfigured(projectRoot)) return false;
+  runGit(
+    projectRoot,
+    ["fetch", "origin", `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`],
+    { ignoreExit: true, timeoutMs: REMOTE_BRANCH_FETCH_TIMEOUT_MS },
+  );
+  return remoteBranchExists(projectRoot, branchName);
+}
+
+/**
  * Recreate a local branch from its remote-tracking counterpart after the
  * local ref was wiped (fresh re-clone of the project repo, manual cleanup of
  * the shared volume, worktree reset). Stage flows commit-and-push before
@@ -232,12 +247,8 @@ function restoreBranchFromRemote(
 ): boolean {
   if (branchExists(projectRoot, branchName)) return true;
 
-  if (!remoteBranchExists(projectRoot, branchName) && opts.fetch && remoteConfigured(projectRoot)) {
-    runGit(
-      projectRoot,
-      ["fetch", "origin", `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`],
-      { ignoreExit: true, timeoutMs: REMOTE_BRANCH_FETCH_TIMEOUT_MS },
-    );
+  if (!remoteBranchExists(projectRoot, branchName) && opts.fetch) {
+    fetchOriginBranch(projectRoot, branchName);
   }
   if (!remoteBranchExists(projectRoot, branchName)) return false;
 
@@ -286,6 +297,19 @@ export function describeDirtyWorkingTree(projectRoot: string): string | null {
   const lines = stdout.split("\n").filter((line) => line.trim().length > 0);
   const summary = lines.slice(0, 5).join(", ");
   return lines.length > 5 ? `${summary}, +${lines.length - 5} more` : summary;
+}
+
+/**
+ * Lossless working-tree state for change detection. Unlike
+ * `describeDirtyWorkingTree` (a 5-line human summary), this returns the full
+ * porcelain output, so two different dirty states never compare equal — and
+ * the "git-error" sentinel keeps a failed probe from comparing equal to a
+ * genuinely clean tree (describeDirtyWorkingTree returns null for both).
+ */
+export function workingTreeFingerprint(projectRoot: string): string {
+  const { stdout, status } = runGit(projectRoot, ["status", "--porcelain"], { ignoreExit: true });
+  if (status !== 0) return "git-error";
+  return stdout.length === 0 ? "clean" : stdout;
 }
 
 export function assertWorkingTreeClean(projectRoot: string, branchName: string | null): void {
@@ -663,6 +687,11 @@ export function ensureTaskWorktree(input: EnsureTaskWorktreeInput): EnsureTaskWo
     );
   }
 
+  // Same wipe-survival as ensureFeatureBranch: recreate the local branch
+  // from its origin-tracking ref instead of re-branching from base, which
+  // would silently drop the branch's already-pushed commits.
+  restoreBranchFromRemote(projectRoot, branchName);
+
   if (!branchExists(projectRoot, branchName)) {
     refreshBaseBranchForWorktree({
       projectRoot,
@@ -722,10 +751,8 @@ export function ensureFeatureBranch(input: EnsureFeatureBranchInput): EnsureFeat
   // deciding to switch, throw branch_missing, or branch anew from base —
   // creating over an origin-pushed branch would silently drop its commits.
   // No fetch here: the planner path resolves brand-new names, so this must
-  // stay a pure local-ref check.
-  restoreBranchFromRemote(projectRoot, branchName);
-
-  if (branchExists(projectRoot, branchName)) {
+  // stay a pure local-ref check. The return value IS the branchExists check.
+  if (restoreBranchFromRemote(projectRoot, branchName)) {
     const { status, stderr } = runGit(projectRoot, ["checkout", branchName], {
       ignoreExit: true,
     });
@@ -998,11 +1025,8 @@ export function syncBranchWithBase(input: SyncBranchWithBaseInput): BranchBaseSy
   const baseBranch = resolvedBase.branchName;
   const remoteRef = `origin/${baseBranch}`;
 
-  if (!remoteBranchExists(projectRoot, baseBranch) && remoteConfigured(projectRoot)) {
-    runGit(projectRoot, ["fetch", "origin", baseBranch], {
-      ignoreExit: true,
-      timeoutMs: REMOTE_BRANCH_FETCH_TIMEOUT_MS,
-    });
+  if (!remoteBranchExists(projectRoot, baseBranch)) {
+    fetchOriginBranch(projectRoot, baseBranch);
   }
   if (!remoteBranchExists(projectRoot, baseBranch)) {
     log.warn(
@@ -1012,15 +1036,37 @@ export function syncBranchWithBase(input: SyncBranchWithBaseInput): BranchBaseSy
     return { status: "skipped", reason: `origin/${baseBranch} unavailable` };
   }
 
-  const { stdout: mergeBaseOut, status: mergeBaseStatus } = runGit(
+  // Resume: a previous run may have left the tree mid-merge (conflicts were
+  // handed to the implementer, then the stage died transiently). Report the
+  // same conflict outcome so the rework prompt stays consistent — degrading
+  // to a "dirty worktree" skip would drop the conflict file list silently.
+  const mergeHeadExists =
+    runGit(projectRoot, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], {
+      ignoreExit: true,
+    }).status === 0;
+  if (mergeHeadExists) {
+    const resumedConflicts = listUnmergedFiles(projectRoot);
+    if (resumedConflicts.length > 0) {
+      log.warn(
+        { projectRoot, branchName, baseBranch, resumedConflicts, taskId },
+        "Base sync resumed an in-progress merge with unresolved conflicts",
+      );
+      return { status: "conflict", baseBranch, conflictedFiles: resumedConflicts };
+    }
+    return {
+      status: "skipped",
+      reason: "mid-merge with conflicts already resolved; commit stage will finish it",
+    };
+  }
+
+  // Exit 0 from `merge-base --is-ancestor` = the base tip is already
+  // contained in the branch — one subprocess instead of merge-base+rev-parse.
+  const { status: baseContained } = runGit(
     projectRoot,
-    ["merge-base", branchName, remoteRef],
+    ["merge-base", "--is-ancestor", remoteRef, branchName],
     { ignoreExit: true },
   );
-  const { stdout: remoteTip } = runGit(projectRoot, ["rev-parse", "--verify", remoteRef], {
-    ignoreExit: true,
-  });
-  if (mergeBaseStatus === 0 && mergeBaseOut && remoteTip && mergeBaseOut === remoteTip) {
+  if (baseContained === 0) {
     return { status: "up_to_date", baseBranch };
   }
 
@@ -1037,13 +1083,7 @@ export function syncBranchWithBase(input: SyncBranchWithBaseInput): BranchBaseSy
 
   const mergeResult = runGit(
     projectRoot,
-    [
-      "merge",
-      remoteRef,
-      "--no-edit",
-      "-m",
-      `merge ${remoteRef} into ${branchName} (base sync on rework)`,
-    ],
+    ["merge", remoteRef, "-m", `merge ${remoteRef} into ${branchName} (base sync on rework)`],
     { ignoreExit: true },
   );
   if (mergeResult.status === 0) {
