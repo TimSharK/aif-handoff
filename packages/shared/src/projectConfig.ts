@@ -50,6 +50,15 @@ export interface AifProjectGit {
    * require feature branches to start from an up-to-date base.
    */
   strict_base_update: boolean;
+  /**
+   * When true, the rework cycle (request_changes) mechanically merges
+   * `origin/<base_branch>` into the task's feature branch BEFORE the
+   * implementer runs. Merge conflicts are handed to the implementer as its
+   * primary task (the tree stays mid-merge; the commit stage completes the
+   * merge commit). When false (default), the rework cycle runs on whatever
+   * the branch currently contains.
+   */
+  sync_base_on_rework: boolean;
 }
 
 export interface AifProjectLanguage {
@@ -112,6 +121,7 @@ const DEFAULT_GIT: AifProjectGit = {
   branch_prefix: "feature/",
   skip_push_after_commit: false,
   strict_base_update: false,
+  sync_base_on_rework: false,
 };
 
 const DEFAULT_LANGUAGE: AifProjectLanguage = {

@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
   getCurrentBranch,
   branchExists,
   isGitRepo,
+  syncBranchWithBase,
 } from "../gitBranch.js";
 
 function initRepo(root: string): void {
@@ -489,5 +490,75 @@ describe("gitBranch helpers", () => {
         expect(err.kind).toBe("dirty_worktree");
       }
     }
+  });
+
+  it("syncBranchWithBase is skipped when git.sync_base_on_rework is off (default)", () => {
+    initRepo(root);
+    execFileSync("git", ["checkout", "-b", "feature/sync"], { cwd: root, stdio: "ignore" });
+    const result = syncBranchWithBase({ projectRoot: root, branchName: "feature/sync" });
+    expect(result.status).toBe("skipped");
+    if (result.status === "skipped") {
+      expect(result.reason).toContain("sync_base_on_rework");
+    }
+  });
+
+  it("syncBranchWithBase merges advanced base commits into the branch", () => {
+    initRepo(root);
+    execFileSync("git", ["checkout", "-b", "feature/sync"], { cwd: root, stdio: "ignore" });
+    initRemoteFixture(root, "feature/sync");
+    // Advance main on the remote: base moves ahead of the branch.
+    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "base-change.txt"), "from main\n");
+    commitAll(root, "base advance");
+    execFileSync("git", ["push", "origin", "main"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["checkout", "feature/sync"], { cwd: root, stdio: "ignore" });
+
+    writeConfig(
+      root,
+      "git:\n  enabled: true\n  base_branch: main\n  create_branches: true\n  branch_prefix: feature/\n  sync_base_on_rework: true\n",
+    );
+    commitAll(root, "config");
+
+    const result = syncBranchWithBase({ projectRoot: root, branchName: "feature/sync" });
+    expect(result.status).toBe("merged");
+    // The merge commit brought the base advance into the working tree.
+    expect(readFileSync(join(root, "base-change.txt"), "utf8")).toContain("from main");
+    // Second run is a no-op — merge-base caught up with origin/main.
+    const again = syncBranchWithBase({ projectRoot: root, branchName: "feature/sync" });
+    expect(again.status).toBe("up_to_date");
+  });
+
+  it("syncBranchWithBase reports conflicts and leaves the tree mid-merge", () => {
+    initRepo(root);
+    writeFileSync(join(root, "conflicted.txt"), "base\n");
+    commitAll(root, "base file");
+    execFileSync("git", ["checkout", "-b", "feature/sync"], { cwd: root, stdio: "ignore" });
+    initRemoteFixture(root, "feature/sync");
+    // Same line changed on both sides.
+    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "conflicted.txt"), "main version\n");
+    commitAll(root, "main edit");
+    execFileSync("git", ["push", "origin", "main"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["checkout", "feature/sync"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "conflicted.txt"), "feature version\n");
+    commitAll(root, "feature edit");
+
+    writeConfig(
+      root,
+      "git:\n  enabled: true\n  base_branch: main\n  create_branches: true\n  branch_prefix: feature/\n  sync_base_on_rework: true\n",
+    );
+    commitAll(root, "config");
+
+    const result = syncBranchWithBase({ projectRoot: root, branchName: "feature/sync" });
+    expect(result.status).toBe("conflict");
+    if (result.status === "conflict") {
+      expect(result.conflictedFiles).toContain("conflicted.txt");
+    }
+    // Tree is mid-merge: unmerged paths exist, MERGE_HEAD is set.
+    const unmerged = execFileSync("git", ["diff", "--name-only", "--diff-filter=U"], {
+      cwd: root,
+      encoding: "utf8",
+    }).trim();
+    expect(unmerged).toContain("conflicted.txt");
   });
 });

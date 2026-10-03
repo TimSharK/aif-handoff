@@ -642,4 +642,58 @@ describe("runImplementer feature branch routing", () => {
       }
     }
   });
+
+  it("blocks a rework run that reports success but changes nothing in the repo", async () => {
+    const db = testDb.current;
+    db.insert(tasks)
+      .values({
+        id: "task-b-noop",
+        projectId: "project-b",
+        title: "Noop rework",
+        description: "",
+        status: "implementing",
+        plan: "## Plan\n- [x] done earlier",
+        reworkRequested: true,
+        branchName: "feature/my-task",
+        reviewComments: "- подлей main",
+      })
+      .run();
+
+    const { StageManualBlockError } = await import("../stageErrorHandler.js");
+    await expect(runImplementer("task-b-noop", projectRoot)).rejects.toBeInstanceOf(
+      StageManualBlockError,
+    );
+    // Task was NOT marked as successfully implemented.
+    const updated = db.select().from(tasks).where(eq(tasks.id, "task-b-noop")).get();
+    expect(updated?.reworkRequested).toBe(true);
+    expect(updated?.implementationLog).toBeNull();
+  });
+
+  it("accepts a rework run that actually modifies the working tree", async () => {
+    const db = testDb.current;
+    db.insert(tasks)
+      .values({
+        id: "task-b-real",
+        projectId: "project-b",
+        title: "Real rework",
+        description: "",
+        status: "implementing",
+        plan: "## Plan\n- [x] done earlier",
+        reworkRequested: true,
+        branchName: "feature/my-task",
+        reviewComments: "- fix the thing",
+      })
+      .run();
+
+    queryMock.mockReset();
+    queryMock.mockImplementation(() => {
+      writeFileSync(join(projectRoot, "rework-change.txt"), "real change\n");
+      return streamSuccess("Rework applied");
+    });
+
+    await runImplementer("task-b-real", projectRoot);
+    const updated = db.select().from(tasks).where(eq(tasks.id, "task-b-real")).get();
+    expect(updated?.reworkRequested).toBe(false);
+    expect(updated?.implementationLog).toContain("Rework applied");
+  });
 });

@@ -235,13 +235,16 @@ export {
   projectUsesSharedBranchIsolation,
   restorePersistedBranch,
   slugifyTitle,
+  syncBranchWithBase,
   validateBranchName,
   workingTreeClean,
+  type BranchBaseSyncResult,
   type EnsureFeatureBranchInput,
   type EnsureFeatureBranchResult,
   type EnsureTaskWorktreeInput,
   type EnsureTaskWorktreeResult,
   type RestorePersistedBranchInput,
+  type SyncBranchWithBaseInput,
 } from "./gitIsolation.js";
 
 export { buildCommitPrompt } from "./commitWorkflow.js";

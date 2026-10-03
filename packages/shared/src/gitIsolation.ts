@@ -937,3 +937,135 @@ export function restorePersistedBranch(input: RestorePersistedBranchInput): void
     "Restored persisted feature branch",
   );
 }
+
+export type BranchBaseSyncResult =
+  | { status: "up_to_date"; baseBranch: string }
+  | { status: "merged"; baseBranch: string; mergeCommitSha: string }
+  | { status: "conflict"; baseBranch: string; conflictedFiles: string[] }
+  | { status: "skipped"; reason: string };
+
+export interface SyncBranchWithBaseInput {
+  projectRoot: string;
+  branchName: string;
+  taskId?: string;
+}
+
+function listUnmergedFiles(projectRoot: string): string[] {
+  const { stdout, status } = runGit(projectRoot, ["diff", "--name-only", "--diff-filter=U"], {
+    ignoreExit: true,
+  });
+  if (status !== 0) return [];
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * Mechanically merge `origin/<base_branch>` into the task's feature branch.
+ * Exists so that rework requests like "merge fresh main in" are performed by
+ * the coordinator's code, deterministically, instead of being delegated to
+ * the implementer model (which is architecturally barred from git operations
+ * and has been observed to report success in seconds without doing them).
+ *
+ * Gate: `git.sync_base_on_rework=true` in the project's .ai-factory config.
+ * Best-effort: a failed fetch or a dirty tree skips the sync with a reason —
+ * the rework itself still runs. The only state it leaves behind on conflict
+ * is a standard mid-merge tree (MERGE_HEAD set), which the implementer
+ * resolves file-by-file and the commit stage finishes with `git commit`.
+ */
+export function syncBranchWithBase(input: SyncBranchWithBaseInput): BranchBaseSyncResult {
+  const { projectRoot, branchName, taskId } = input;
+  const config = resolveGitConfig(projectRoot);
+  if (!config.sync_base_on_rework) {
+    return { status: "skipped", reason: "git.sync_base_on_rework=false" };
+  }
+  if (!isGitRepo(projectRoot)) {
+    return { status: "skipped", reason: "not a git work tree" };
+  }
+  if (!branchExists(projectRoot, branchName)) {
+    return { status: "skipped", reason: `branch ${branchName} is missing` };
+  }
+  if (getCurrentBranch(projectRoot) !== branchName) {
+    return { status: "skipped", reason: `HEAD is not on ${branchName}` };
+  }
+
+  const resolvedBase = resolveBaseBranch(
+    projectRoot,
+    config.base_branch,
+    hasProjectConfigFile(projectRoot),
+  );
+  const baseBranch = resolvedBase.branchName;
+  const remoteRef = `origin/${baseBranch}`;
+
+  if (!remoteBranchExists(projectRoot, baseBranch) && remoteConfigured(projectRoot)) {
+    runGit(projectRoot, ["fetch", "origin", baseBranch], {
+      ignoreExit: true,
+      timeoutMs: REMOTE_BRANCH_FETCH_TIMEOUT_MS,
+    });
+  }
+  if (!remoteBranchExists(projectRoot, baseBranch)) {
+    log.warn(
+      { projectRoot, branchName, baseBranch, taskId },
+      "Base sync skipped: origin base branch is not available",
+    );
+    return { status: "skipped", reason: `origin/${baseBranch} unavailable` };
+  }
+
+  const { stdout: mergeBaseOut, status: mergeBaseStatus } = runGit(
+    projectRoot,
+    ["merge-base", branchName, remoteRef],
+    { ignoreExit: true },
+  );
+  const { stdout: remoteTip } = runGit(projectRoot, ["rev-parse", "--verify", remoteRef], {
+    ignoreExit: true,
+  });
+  if (mergeBaseStatus === 0 && mergeBaseOut && remoteTip && mergeBaseOut === remoteTip) {
+    return { status: "up_to_date", baseBranch };
+  }
+
+  // A mid-stage dirty tree means something unusual already happened; merging
+  // into it would tangle that state with the base sync. Skip loudly.
+  const dirty = describeDirtyWorkingTree(projectRoot);
+  if (dirty) {
+    log.warn(
+      { projectRoot, branchName, dirty, taskId },
+      "Base sync skipped: working tree is dirty",
+    );
+    return { status: "skipped", reason: "dirty worktree" };
+  }
+
+  const mergeResult = runGit(
+    projectRoot,
+    [
+      "merge",
+      remoteRef,
+      "--no-edit",
+      "-m",
+      `merge ${remoteRef} into ${branchName} (base sync on rework)`,
+    ],
+    { ignoreExit: true },
+  );
+  if (mergeResult.status === 0) {
+    log.info(
+      { projectRoot, branchName, baseBranch, taskId },
+      "Base sync merged origin base branch into feature branch",
+    );
+    return { status: "merged", baseBranch, mergeCommitSha: getHeadCommitSha(projectRoot) ?? "" };
+  }
+
+  const conflictedFiles = listUnmergedFiles(projectRoot);
+  if (conflictedFiles.length > 0) {
+    log.warn(
+      { projectRoot, branchName, baseBranch, conflictedFiles, taskId },
+      "Base sync produced merge conflicts; handing resolution to implementer",
+    );
+    return { status: "conflict", baseBranch, conflictedFiles };
+  }
+
+  log.warn(
+    { projectRoot, branchName, baseBranch, stderr: mergeResult.stderr, taskId },
+    "Base sync merge failed without conflict markers",
+  );
+  return { status: "skipped", reason: "merge failed without conflicts" };
+}
