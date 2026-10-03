@@ -271,6 +271,17 @@ export async function runImplementer(taskId: string, projectRoot: string): Promi
     }
   }
 
+  // On a base-sync conflict the model's job is to resolve the mid-merge tree
+  // the coordinator just left it — the pre-round baseline no longer applies
+  // (the merge itself changed the fingerprint without any model work), so the
+  // guard baseline becomes the post-sync state. For every other sync outcome
+  // the pre-round baseline stands: a mechanical merge legitimately moves HEAD
+  // without the model touching anything.
+  const postSyncHeadSha =
+    baseSyncResult?.status === "conflict" ? getHeadCommitSha(projectRoot) : null;
+  const postSyncTreeFingerprint =
+    baseSyncResult?.status === "conflict" ? workingTreeFingerprint(projectRoot) : null;
+
   const project = findProjectById(task.projectId);
   const implementerBudget = project?.implementerMaxBudgetUsd ?? null;
   const useSubagents = task.useSubagents;
@@ -478,12 +489,14 @@ Execution rules:
   // visible to the human, and a genuine no-change-needed outcome can be
   // resolved by inspection and a manual done.
   if (noopGuard) {
+    const baselineHeadSha = postSyncHeadSha ?? preRunHeadSha;
+    const baselineTreeFingerprint = postSyncTreeFingerprint ?? preRunTreeFingerprint;
     if (
-      getHeadCommitSha(projectRoot) === preRunHeadSha &&
-      workingTreeFingerprint(projectRoot) === preRunTreeFingerprint
+      getHeadCommitSha(projectRoot) === baselineHeadSha &&
+      workingTreeFingerprint(projectRoot) === baselineTreeFingerprint
     ) {
       throw new StageManualBlockError(
-        `Rework no-op: implementer finished with no repo changes (HEAD unchanged at ${(preRunHeadSha ?? "unknown").slice(0, 8)}, working tree unchanged) while a rework request was pending. Refusing to accept a rework round that did nothing.`,
+        `Rework no-op: implementer finished with no repo changes (HEAD unchanged at ${(baselineHeadSha ?? "unknown").slice(0, 8)}, working tree unchanged) while a rework request was pending. Refusing to accept a rework round that did nothing.`,
       );
     }
   }

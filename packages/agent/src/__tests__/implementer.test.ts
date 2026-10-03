@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projects, taskComments, taskExecutorHistory, tasks } from "@aif/shared";
@@ -695,5 +695,104 @@ describe("runImplementer feature branch routing", () => {
     const updated = db.select().from(tasks).where(eq(tasks.id, "task-b-real")).get();
     expect(updated?.reworkRequested).toBe(false);
     expect(updated?.implementationLog).toContain("Rework applied");
+  });
+
+  /** Divergent branch vs origin/main over one file + sync_base_on_rework
+   *  enabled — runImplementer's base sync hits a real merge conflict. */
+  function setupBaseSyncConflictFixture(): void {
+    const originPath = `${projectRoot}-origin.git`;
+    execFileSync("git", ["init", "--bare", "--initial-branch=main", originPath], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["remote", "add", "origin", originPath], {
+      cwd: projectRoot,
+      stdio: "ignore",
+    });
+    // Branch side: config flag + divergent edit of conflicted.txt. HEAD is
+    // on main after the beforeEach — switch to the task branch first.
+    execFileSync("git", ["checkout", "feature/my-task"], { cwd: projectRoot, stdio: "ignore" });
+    mkdirSync(join(projectRoot, ".ai-factory"), { recursive: true });
+    writeFileSync(
+      join(projectRoot, ".ai-factory", "config.yaml"),
+      "git:\n  enabled: true\n  base_branch: main\n  create_branches: true\n  branch_prefix: feature/\n  sync_base_on_rework: true\n",
+    );
+    writeFileSync(join(projectRoot, "conflicted.txt"), "feature version\n");
+    execFileSync("git", ["add", "-A"], { cwd: projectRoot, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "feature side", "--no-verify"], {
+      cwd: projectRoot,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["push", "origin", "feature/my-task"], {
+      cwd: projectRoot,
+      stdio: "ignore",
+    });
+    // Main side: same line, different content.
+    execFileSync("git", ["checkout", "main"], { cwd: projectRoot, stdio: "ignore" });
+    writeFileSync(join(projectRoot, "conflicted.txt"), "main version\n");
+    execFileSync("git", ["add", "-A"], { cwd: projectRoot, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "main side", "--no-verify"], {
+      cwd: projectRoot,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["push", "origin", "main"], { cwd: projectRoot, stdio: "ignore" });
+    execFileSync("git", ["checkout", "feature/my-task"], { cwd: projectRoot, stdio: "ignore" });
+  }
+
+  it("blocks a rework that leaves base-sync merge conflicts unresolved (no-op on mid-merge tree)", async () => {
+    setupBaseSyncConflictFixture();
+    const db = testDb.current;
+    db.insert(tasks)
+      .values({
+        id: "task-b-conflict-noop",
+        projectId: "project-b",
+        title: "Conflict noop",
+        description: "",
+        status: "implementing",
+        plan: "## Plan\n- [x] done earlier",
+        reworkRequested: true,
+        branchName: "feature/my-task",
+        reviewComments: "- подлей main",
+      })
+      .run();
+
+    const { StageManualBlockError } = await import("../stageErrorHandler.js");
+    await expect(runImplementer("task-b-conflict-noop", projectRoot)).rejects.toBeInstanceOf(
+      StageManualBlockError,
+    );
+    // Tree stays mid-merge with the conflict intact for the next round.
+    const unmerged = execFileSync("git", ["diff", "--name-only", "--diff-filter=U"], {
+      cwd: projectRoot,
+      encoding: "utf8",
+    }).trim();
+    expect(unmerged).toContain("conflicted.txt");
+  });
+
+  it("accepts a rework that resolves the base-sync conflicts", async () => {
+    setupBaseSyncConflictFixture();
+    const db = testDb.current;
+    db.insert(tasks)
+      .values({
+        id: "task-b-conflict-resolved",
+        projectId: "project-b",
+        title: "Conflict resolved",
+        description: "",
+        status: "implementing",
+        plan: "## Plan\n- [x] done earlier",
+        reworkRequested: true,
+        branchName: "feature/my-task",
+        reviewComments: "- подлей main",
+      })
+      .run();
+
+    queryMock.mockReset();
+    queryMock.mockImplementation(() => {
+      writeFileSync(join(projectRoot, "conflicted.txt"), "resolved version\n");
+      return streamSuccess("Conflicts resolved");
+    });
+
+    await runImplementer("task-b-conflict-resolved", projectRoot);
+    const updated = db.select().from(tasks).where(eq(tasks.id, "task-b-conflict-resolved")).get();
+    expect(updated?.reworkRequested).toBe(false);
+    expect(updated?.implementationLog).toContain("Conflicts resolved");
   });
 });

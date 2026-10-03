@@ -305,11 +305,26 @@ export function describeDirtyWorkingTree(projectRoot: string): string | null {
  * porcelain output, so two different dirty states never compare equal — and
  * the "git-error" sentinel keeps a failed probe from comparing equal to a
  * genuinely clean tree (describeDirtyWorkingTree returns null for both).
+ *
+ * Unmerged files get their worktree content hash folded in: their porcelain
+ * code ("AA"/"UU") stays constant across conflict-marker edits, because a
+ * resolution only reaches the index on `git add` — which the implementer
+ * model is barred from running. Without the content hash, resolving a
+ * conflict by editing the file would look like "no change".
  */
 export function workingTreeFingerprint(projectRoot: string): string {
   const { stdout, status } = runGit(projectRoot, ["status", "--porcelain"], { ignoreExit: true });
   if (status !== 0) return "git-error";
-  return stdout.length === 0 ? "clean" : stdout;
+  const base = stdout.length === 0 ? "clean" : stdout;
+  const unmerged = listUnmergedFiles(projectRoot);
+  if (unmerged.length === 0) return base;
+  const contentHashes = unmerged.map((file) => {
+    const { stdout: hashOut } = runGit(projectRoot, ["hash-object", "--", file], {
+      ignoreExit: true,
+    });
+    return `${file}:${hashOut || "unreadable"}`;
+  });
+  return `${base}\n${contentHashes.join("\n")}`;
 }
 
 export function assertWorkingTreeClean(projectRoot: string, branchName: string | null): void {
