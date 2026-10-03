@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,6 +28,18 @@ function initRepo(root: string): void {
   });
 }
 
+/** Bare origin beside `root` with `main` + `branch` pushed — simulates the
+ *  "local ref wiped, branch lives on origin" state a repo re-clone leaves. */
+function initRemoteFixture(root: string, branch: string): string {
+  const originPath = `${root}-origin.git`;
+  execFileSync("git", ["init", "--bare", "--initial-branch=main", originPath], {
+    stdio: "ignore",
+  });
+  execFileSync("git", ["remote", "add", "origin", originPath], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["push", "origin", "main", branch], { cwd: root, stdio: "ignore" });
+  return originPath;
+}
+
 function writeConfig(root: string, yaml: string): void {
   const dir = join(root, ".ai-factory");
   mkdirSync(dir, { recursive: true });
@@ -50,6 +62,7 @@ describe("gitBranch helpers", () => {
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
+    rmSync(`${root}-origin.git`, { recursive: true, force: true });
   });
 
   it("slugifyTitle lowercases, hyphenates, trims length", () => {
@@ -384,6 +397,65 @@ describe("gitBranch helpers", () => {
         expect(err.kind).toBe("branch_missing");
       }
     }
+  });
+
+  it("restorePersistedBranch restores a locally deleted branch from the origin tracking ref", async () => {
+    initRepo(root);
+    execFileSync("git", ["checkout", "-b", "feature/ok"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "work.txt"), "done\n");
+    commitAll(root, "stage work");
+    initRemoteFixture(root, "feature/ok");
+    // Repo-level wipe: local ref gone, remote-tracking ref intact (re-clone).
+    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["branch", "-D", "feature/ok"], { cwd: root, stdio: "ignore" });
+    const {
+      restorePersistedBranch,
+      getCurrentBranch: curr,
+      branchExists: exists,
+    } = await import("../gitBranch.js");
+    restorePersistedBranch({ projectRoot: root, taskId: "t1", persistedBranchName: "feature/ok" });
+    expect(curr(root)).toBe("feature/ok");
+    expect(exists(root, "feature/ok")).toBe(true);
+    expect(existsSync(join(root, "work.txt"))).toBe(true);
+  });
+
+  it("restorePersistedBranch fetches the branch from origin when even the tracking ref is gone", async () => {
+    initRepo(root);
+    execFileSync("git", ["checkout", "-b", "feature/ok"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "work.txt"), "done\n");
+    commitAll(root, "stage work");
+    initRemoteFixture(root, "feature/ok");
+    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["branch", "-D", "feature/ok"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["update-ref", "-d", "refs/remotes/origin/feature/ok"], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    const { restorePersistedBranch, getCurrentBranch: curr } = await import("../gitBranch.js");
+    restorePersistedBranch({ projectRoot: root, taskId: "t1", persistedBranchName: "feature/ok" });
+    expect(curr(root)).toBe("feature/ok");
+    expect(existsSync(join(root, "work.txt"))).toBe(true);
+  });
+
+  it("ensureFeatureBranch(switchOnly) restores a branch that only exists on the tracking ref", async () => {
+    initRepo(root);
+    execFileSync("git", ["checkout", "-b", "feature/remote-only"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "work.txt"), "done\n");
+    commitAll(root, "stage work");
+    initRemoteFixture(root, "feature/remote-only");
+    execFileSync("git", ["checkout", "main"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["branch", "-D", "feature/remote-only"], { cwd: root, stdio: "ignore" });
+    const { ensureFeatureBranch: fn, getCurrentBranch: curr } = await import("../gitBranch.js");
+    const result = fn({
+      projectRoot: root,
+      taskId: "t1",
+      title: "x",
+      explicitBranchName: "feature/remote-only",
+      switchOnly: true,
+    });
+    expect(result.action).toBe("switched");
+    expect(curr(root)).toBe("feature/remote-only");
+    expect(existsSync(join(root, "work.txt"))).toBe(true);
   });
 
   it("restorePersistedBranch switches and is idempotent", async () => {

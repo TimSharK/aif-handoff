@@ -120,12 +120,13 @@ export function buildTaskWorktreePath(
 function runGit(
   cwd: string,
   args: string[],
-  opts: { ignoreExit?: boolean } = {},
+  opts: { ignoreExit?: boolean; timeoutMs?: number } = {},
 ): { stdout: string; stderr: string; status: number } {
   const options: ExecFileSyncOptionsWithStringEncoding = {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
   };
   try {
     const stdout = execFileSync("git", args, options);
@@ -197,6 +198,66 @@ function remoteBranchExists(projectRoot: string, branchName: string): boolean {
     { ignoreExit: true },
   );
   return status === 0;
+}
+
+/** Upper bound for the narrow single-branch fetch below — a hung remote
+ *  (VPN down, GitLab unreachable) must not stall stage startup. */
+const REMOTE_BRANCH_FETCH_TIMEOUT_MS = 30_000;
+
+function remoteConfigured(projectRoot: string): boolean {
+  const { status } = runGit(projectRoot, ["remote", "get-url", "origin"], {
+    ignoreExit: true,
+  });
+  return status === 0;
+}
+
+/**
+ * Recreate a local branch from its remote-tracking counterpart after the
+ * local ref was wiped (fresh re-clone of the project repo, manual cleanup of
+ * the shared volume, worktree reset). Stage flows commit-and-push before
+ * transitioning, so origin is the source of truth for a persisted branch;
+ * restoring from it keeps a repo-level incident from escalating into a
+ * permanent `blocked_external (branch_missing)` that needs manual repair.
+ *
+ * Best-effort and quiet by design: no-op when the local ref already exists,
+ * trusts the existing `refs/remotes/origin/<branch>` ref when present, and
+ * only reaches for the network (`fetch: true`) when that ref is absent and
+ * the remote is configured. Returns false when the branch is not
+ * recoverable — callers fall back to their loud BranchIsolationError.
+ */
+function restoreBranchFromRemote(
+  projectRoot: string,
+  branchName: string,
+  opts: { fetch?: boolean } = {},
+): boolean {
+  if (branchExists(projectRoot, branchName)) return true;
+
+  if (!remoteBranchExists(projectRoot, branchName) && opts.fetch && remoteConfigured(projectRoot)) {
+    runGit(
+      projectRoot,
+      ["fetch", "origin", `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`],
+      { ignoreExit: true, timeoutMs: REMOTE_BRANCH_FETCH_TIMEOUT_MS },
+    );
+  }
+  if (!remoteBranchExists(projectRoot, branchName)) return false;
+
+  const { status, stderr } = runGit(
+    projectRoot,
+    ["branch", "--track", branchName, `origin/${branchName}`],
+    { ignoreExit: true },
+  );
+  if (status !== 0) {
+    log.warn(
+      { projectRoot, branchName, stderr },
+      "Could not restore missing branch from origin despite existing remote ref",
+    );
+    return false;
+  }
+  log.warn(
+    { projectRoot, branchName },
+    "Local feature branch was missing; restored from origin (local ref lost between stages?)",
+  );
+  return true;
 }
 
 function getOriginHeadBranch(projectRoot: string): string | null {
@@ -656,6 +717,14 @@ export function ensureFeatureBranch(input: EnsureFeatureBranchInput): EnsureFeat
 
   assertWorkingTreeClean(projectRoot, branchName);
 
+  // Survive a repo-level wipe (re-clone, volume cleanup) with only the
+  // remote-tracking ref left: recreate the local branch from origin before
+  // deciding to switch, throw branch_missing, or branch anew from base —
+  // creating over an origin-pushed branch would silently drop its commits.
+  // No fetch here: the planner path resolves brand-new names, so this must
+  // stay a pure local-ref check.
+  restoreBranchFromRemote(projectRoot, branchName);
+
   if (branchExists(projectRoot, branchName)) {
     const { status, stderr } = runGit(projectRoot, ["checkout", branchName], {
       ignoreExit: true,
@@ -797,6 +866,8 @@ export function ensureFeatureBranch(input: EnsureFeatureBranchInput): EnsureFeat
  *  - `not_a_repo_with_persisted_branch`  — repo was deleted / moved
  *  - `invalid_branch_name`               — persisted value is not a ref git accepts
  *  - `branch_missing`                    — branch was deleted between stages
+ *                                          and is absent on origin too (an
+ *                                          origin copy is restored instead)
  *  - `dirty_worktree`                    — switch would clobber uncommitted changes
  *  - `checkout_failed`                   — git refused the switch
  */
@@ -835,12 +906,16 @@ export function restorePersistedBranch(input: RestorePersistedBranchInput): void
   }
 
   if (!branchExists(projectRoot, persistedBranchName)) {
-    throw new BranchIsolationError(
-      "branch_missing",
-      `Expected feature branch ${persistedBranchName} is missing from ${projectRoot}. It was deleted between stages.`,
-      projectRoot,
-      persistedBranchName,
-    );
+    // A repo-level wipe (re-clone, volume cleanup) deletes the local ref but
+    // leaves the pushed branch on origin — restore instead of blocking.
+    if (!restoreBranchFromRemote(projectRoot, persistedBranchName, { fetch: true })) {
+      throw new BranchIsolationError(
+        "branch_missing",
+        `Expected feature branch ${persistedBranchName} is missing from ${projectRoot} (local and origin). It was deleted between stages and was never pushed.`,
+        projectRoot,
+        persistedBranchName,
+      );
+    }
   }
 
   assertWorkingTreeClean(projectRoot, persistedBranchName);
